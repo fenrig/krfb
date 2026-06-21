@@ -497,9 +497,12 @@ PWFrameBuffer::~PWFrameBuffer()
 void PWFrameBuffer::initDBus()
 {
     d->usePortal = true;
-    // LibVNCServer needs non-zero dimensions before PipeWire delivers its
-    // first frame. setVideoSize() will replace this and notify the servers.
-    d->setVideoSize(QSize(1, 1));
+    // LibVNCServer needs usable dimensions before PipeWire delivers its first
+    // frame. The selected source may differ; setVideoSize() will replace this
+    // fallback and notify the servers when capture starts.
+    const QScreen *screen = QGuiApplication::primaryScreen();
+    const QSize fallbackSize = screen ? screen->size() * screen->devicePixelRatio() : QSize(640, 480);
+    d->setVideoSize(fallbackSize);
 }
 
 void PWFrameBuffer::startVirtualMonitor(const QString &name, const QSize &resolution, qreal dpr)
