@@ -13,6 +13,7 @@
 
 // Qt
 #include <QCoreApplication>
+#include <QDBusMessage>
 #include <QDebug>
 #include <QGuiApplication>
 #include <QRandomGenerator>
@@ -76,6 +77,8 @@ private:
     friend class PWFrameBuffer;
 
     void initDbus();
+    void createStream();
+    void stopDbus();
 
     // dbus handling
     void handleSessionCreated(quint32 code, const QVariantMap &results);
@@ -97,12 +100,15 @@ private:
 
     // XDP screencast session handle
     QDBusObjectPath sessionPath;
+    QStringList requestPaths;
 
     // screen geometry holder
     QSize videoSize;
 
     // sanity indicator
     bool isValid = true;
+    bool usePortal = false;
+    bool monitoring = false;
     std::unique_ptr<PipeWireSourceStream> stream;
     std::optional<PipeWireCursor> cursor;
     DmaBufHandler m_dmabufHandler;
@@ -110,8 +116,12 @@ private:
 
 PWFrameBuffer::Private::Private(PWFrameBuffer *q)
     : q(q)
-    , stream(new PipeWireSourceStream(q))
 {
+}
+
+void PWFrameBuffer::Private::createStream()
+{
+    stream = std::make_unique<PipeWireSourceStream>(q);
     QObject::connect(stream.get(), &PipeWireSourceStream::frameReceived, q, [this](const PipeWireFrame &frame) {
         handleFrame(frame);
     });
@@ -124,6 +134,10 @@ PWFrameBuffer::Private::Private(PWFrameBuffer *q)
  */
 void PWFrameBuffer::Private::initDbus()
 {
+    if (!monitoring) {
+        return;
+    }
+
     qInfo() << "Initializing D-Bus connectivity with XDG Desktop Portal";
     dbusXdpScreenCastService.reset(new OrgFreedesktopPortalScreenCastInterface(QStringLiteral("org.freedesktop.portal.Desktop"),
                                                                                QStringLiteral("/org/freedesktop/portal/desktop"),
@@ -149,6 +163,7 @@ void PWFrameBuffer::Private::initDbus()
         isValid = false;
         return;
     }
+    requestPaths.append(sessionReply.value().path());
 
     qInfo() << "DBus session created: " << sessionReply.value().path();
     QDBusConnection::sessionBus().connect(QString(),
@@ -157,6 +172,36 @@ void PWFrameBuffer::Private::initDbus()
                                           QStringLiteral("Response"),
                                           this->q,
                                           SLOT(handleXdpSessionCreated(uint, QVariantMap)));
+}
+
+void PWFrameBuffer::Private::stopDbus()
+{
+    monitoring = false;
+
+    QDBusConnection::sessionBus().disconnect(QString(), QString(), QStringLiteral("org.freedesktop.portal.Request"), QStringLiteral("Response"), q, nullptr);
+
+    for (const QString &requestPath : std::as_const(requestPaths)) {
+        const QDBusMessage close = QDBusMessage::createMethodCall(QStringLiteral("org.freedesktop.portal.Desktop"),
+                                                                  requestPath,
+                                                                  QStringLiteral("org.freedesktop.portal.Request"),
+                                                                  QStringLiteral("Close"));
+        QDBusConnection::sessionBus().call(close, QDBus::NoBlock);
+    }
+    requestPaths.clear();
+
+    if (!sessionPath.path().isEmpty()) {
+        const QDBusMessage close = QDBusMessage::createMethodCall(QStringLiteral("org.freedesktop.portal.Desktop"),
+                                                                  sessionPath.path(),
+                                                                  QStringLiteral("org.freedesktop.portal.Session"),
+                                                                  QStringLiteral("Close"));
+        QDBusConnection::sessionBus().call(close, QDBus::NoBlock);
+    }
+
+    sessionPath = {};
+    stream.reset();
+    dbusXdpScreenCastService.reset();
+    dbusXdpRemoteDesktopService.reset();
+    cursor.reset();
 }
 
 void PWFrameBuffer::handleXdpSessionCreated(quint32 code, const QVariantMap &results)
@@ -173,6 +218,9 @@ void PWFrameBuffer::handleXdpSessionCreated(quint32 code, const QVariantMap &res
  */
 void PWFrameBuffer::Private::handleSessionCreated(quint32 code, const QVariantMap &results)
 {
+    if (!monitoring) {
+        return;
+    }
     if (code != 0) {
         qCWarning(KRFB_FB_PIPEWIRE) << "Failed to create session: " << code;
         isValid = false;
@@ -202,6 +250,7 @@ void PWFrameBuffer::Private::handleSessionCreated(quint32 code, const QVariantMa
         isValid = false;
         return;
     }
+    requestPaths.append(selectorReply.value().path());
     QDBusConnection::sessionBus().connect(QString(),
                                           selectorReply.value().path(),
                                           QStringLiteral("org.freedesktop.portal.Request"),
@@ -223,6 +272,9 @@ void PWFrameBuffer::handleXdpDevicesSelected(quint32 code, const QVariantMap &re
  */
 void PWFrameBuffer::Private::handleDevicesSelected(quint32 code, const QVariantMap &results)
 {
+    if (!monitoring) {
+        return;
+    }
     Q_UNUSED(results)
     if (code != 0) {
         qCWarning(KRFB_FB_PIPEWIRE) << "Failed to select devices: " << code;
@@ -242,6 +294,7 @@ void PWFrameBuffer::Private::handleDevicesSelected(quint32 code, const QVariantM
         isValid = false;
         return;
     }
+    requestPaths.append(selectorReply.value().path());
     QDBusConnection::sessionBus().connect(QString(),
                                           selectorReply.value().path(),
                                           QStringLiteral("org.freedesktop.portal.Request"),
@@ -265,6 +318,9 @@ void PWFrameBuffer::handleXdpSourcesSelected(quint32 code, const QVariantMap &re
  */
 void PWFrameBuffer::Private::handleSourcesSelected(quint32 code, const QVariantMap &)
 {
+    if (!monitoring) {
+        return;
+    }
     if (code != 0) {
         qCWarning(KRFB_FB_PIPEWIRE) << "Failed to select sources: " << code;
         isValid = false;
@@ -276,6 +332,12 @@ void PWFrameBuffer::Private::handleSourcesSelected(quint32 code, const QVariantM
         {QStringLiteral("handle_token"), QStringLiteral("krfb%1").arg(QRandomGenerator::global()->generate())}};
     auto startReply = dbusXdpRemoteDesktopService->Start(sessionPath, QString(), startParameters);
     startReply.waitForFinished();
+    if (!startReply.isValid()) {
+        qCWarning(KRFB_FB_PIPEWIRE) << "Couldn't start the remote-desktop session";
+        isValid = false;
+        return;
+    }
+    requestPaths.append(startReply.value().path());
     QDBusConnection::sessionBus().connect(QString(),
                                           startReply.value().path(),
                                           QStringLiteral("org.freedesktop.portal.Request"),
@@ -298,6 +360,9 @@ void PWFrameBuffer::handleXdpRemoteDesktopStarted(quint32 code, const QVariantMa
  */
 void PWFrameBuffer::Private::handleRemoteDesktopStarted(quint32 code, const QVariantMap &results)
 {
+    if (!monitoring) {
+        return;
+    }
     if (code != 0) {
         qCWarning(KRFB_FB_PIPEWIRE) << "Failed to start screencast: " << code;
         isValid = false;
@@ -361,8 +426,8 @@ void PWFrameBuffer::Private::handleFrame(const PipeWireFrame &frame)
 
 #if KPIPEWIRE60
     if (frame.image) {
-        memcpy(q->fb, frame.image->constBits(), frame.image->sizeInBytes());
         setVideoSize(frame.image->size());
+        memcpy(q->fb, frame.image->constBits(), frame.image->sizeInBytes());
     }
 #else
     if (frame.dataFrame) {
@@ -424,17 +489,24 @@ PWFrameBuffer::PWFrameBuffer(QObject *parent)
 
 PWFrameBuffer::~PWFrameBuffer()
 {
+    stopMonitor();
     free(fb);
     fb = nullptr;
 }
 
 void PWFrameBuffer::initDBus()
 {
-    d->initDbus();
+    d->usePortal = true;
+    // LibVNCServer needs non-zero dimensions before PipeWire delivers its
+    // first frame. setVideoSize() will replace this and notify the servers.
+    d->setVideoSize(QSize(1, 1));
 }
 
 void PWFrameBuffer::startVirtualMonitor(const QString &name, const QSize &resolution, qreal dpr)
 {
+    if (!d->stream) {
+        d->createStream();
+    }
     d->videoSize = resolution * dpr;
     using namespace KWayland::Client;
     auto connection = ConnectionThread::fromApplication(this);
@@ -496,16 +568,31 @@ void PWFrameBuffer::getServerFormat(rfbPixelFormat &format)
 
 void PWFrameBuffer::startMonitor()
 {
+    if (!d->usePortal || d->monitoring) {
+        return;
+    }
+
+    d->monitoring = true;
+    d->isValid = true;
+    if (!d->stream) {
+        d->createStream();
+    }
+    d->initDbus();
 }
 
 void PWFrameBuffer::stopMonitor()
 {
+    if (!d->usePortal || !d->monitoring) {
+        return;
+    }
+
+    d->stopDbus();
 }
 
 QVariant PWFrameBuffer::customProperty(const QString &property) const
 {
     if (property == QLatin1String("stream_node_id")) {
-        return QVariant::fromValue<uint>(d->stream->nodeId());
+        return QVariant::fromValue<uint>(d->stream ? d->stream->nodeId() : 0);
     }
     if (property == QLatin1String("session_handle")) {
         return QVariant::fromValue<QDBusObjectPath>(d->sessionPath);

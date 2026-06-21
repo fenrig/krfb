@@ -21,8 +21,7 @@ FrameBuffer *PWFrameBufferPlugin::frameBuffer(const QVariantMap &args)
     if (args.contains(QLatin1String("name"))) {
         pwfb->startVirtualMonitor(args[QStringLiteral("name")].toString(), args[QStringLiteral("resolution")].toSize(), args[QStringLiteral("scale")].toDouble());
     } else {
-        // D-Bus is most important in XDG-Desktop-Portals init chain, no toys for us if something is wrong with XDP
-        // PipeWire connectivity is initialized after D-Bus session is started
+        // Defer portal and PipeWire setup until the first client connects.
         pwfb->initDBus();
     }
 
